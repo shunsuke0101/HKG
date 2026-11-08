@@ -1,56 +1,118 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# coding: utf-8
+# -----------------------------------------------------------------------------------#
+# @file           HKG/hkg_nagoya_flights.py
+# @brief          香港国際空港(HKG) カーゴ便 名古屋(NGO)関連便 Discord 通知スクリプト
+# @author         Kidera Shunsuke
+# @date           2026/11/08
+# $Version:       1.00
+# $Revision:      2026/11/08
+# @note           hongkongairport.com の flightinfo-rest API から出発・到着便を取得し NGO 便を通知
+# @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
+# @par            History
+#                 v1.00 (2026/11/08) - 新規作成
+# Copyright (c) 2026. All Rights reserved.
+#
+# -----------------------------------------------------------------------------------#
+
 """
-香港国際空港（HKG）カーゴフライト（出発・到着）の Nagoya (NGO) 便を抽出して Discord に通知する。
-表示は Changi / 仁川 の通知と共通の表形式。
+========================================================================================
+モジュール概要：香港国際空港(HKG) カーゴ便 名古屋(NGO)関連便 Discord 通知スクリプト
+========================================================================================
+香港国際空港（HKG）カーゴフライト（出発・到着）の Nagoya (NGO) 便を抽出して Discord に通知します。
+表示は Changi / 仁川 の通知と共通の表形式です。
 
 使い方:
     python hkg_nagoya_flights.py              # 3 日分を取得して Discord へ通知
     python hkg_nagoya_flights.py --dry-run    # 送信せず表示のみ
     python hkg_nagoya_flights.py --only-new   # 前回通知から変化が無ければ送らない
 
-前回通知からの変化（実績時刻が入った、予定が変わった、新しい便 など）は行頭に「!」を付け、
-状態欄に「←前回値」を添えて目立たせる。状態は notified_state.json に保存。
+変化検知:
+    前回通知からの変化（実績時刻が入った、予定が変わった、新しい便 など）は 🔔(変化) / 🆕(新規) の印を付け、
+    状態欄に前回値を添えて目立たせます。状態は notified_state.json に保存します。
+========================================================================================
 """
-import argparse
-import datetime as dt
-import json
-import os
-import re
-import sys
-import time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
-import requests
+# 標準ライブラリ
+import argparse                                   # コマンドライン引数解析
+import datetime as dt                             # 日付・時刻処理
+import json                                       # JSON 入出力
+import os                                         # 環境変数アクセス
+import re                                         # 正規表現
+import sys                                        # 標準エラー出力・終了コード
+import time                                       # 時間計測・待機
+from concurrent.futures import ThreadPoolExecutor  # 並列リクエスト
+from pathlib import Path                          # パス操作
 
-BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "notified_state.json"
+# 外部ライブラリ
+import requests                                   # HTTP 通信
 
+
+# ======================================================================================#
+# ファイル・パス設定
+# ======================================================================================#
+BASE_DIR = Path(__file__).resolve().parent        # スクリプト配置フォルダ
+STATE_FILE = BASE_DIR / "notified_state.json"     # 前回通知状態の保存先
+
+# ======================================================================================#
+# 香港国際空港 API 設定
+# ======================================================================================#
+# HTTP リクエストヘッダー
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.hongkongairport.com/en/flights/departures/cargo.page",
 }
-BASE_URL = "https://www.hongkongairport.com/flightinfo-rest/rest/flights"
+BASE_URL = "https://www.hongkongairport.com/flightinfo-rest/rest/flights"  # 便情報 REST API
+# クエリパラメータのテンプレート（cargo パラメータの表記揺れに対応するため順に試す）
 PARAM_TEMPLATES = [
     "type={type}&cargo=true&lang=en&date={date}",
     "type={type}&cargo=Y&lang=en&date={date}",
 ]
-NAGOYA_WORDS = ("nagoya", "chubu", "centrair", "中部")
-NAGOYA_CODE = "ngo"
-WEEKDAY_JA = "月火水木金土日"
 
+# ======================================================================================#
+# 名古屋判定・表示設定
+# ======================================================================================#
+NAGOYA_WORDS = ("nagoya", "chubu", "centrair", "中部")  # 空港名称に含まれる語（小文字）
+NAGOYA_CODE = "ngo"                               # IATA コード（小文字）
+WEEKDAY_JA = "月火水木金土日"                      # 曜日表記（weekday() のインデックス順）
+
+# ======================================================================================#
+# 所要時間・時差設定
+# ======================================================================================#
 # 名古屋側時刻の推定に使う標準所要時間（分）。香港 UTC+8 → 日本 UTC+9 なので +1h
-FLIGHT_MIN_HKG_NGO = 220
-FLIGHT_MIN_NGO_HKG = 250
-TZ_DIFF_MIN = 60
+FLIGHT_MIN_HKG_NGO = 220                          # HKG→NGO 所要時間（分）
+FLIGHT_MIN_NGO_HKG = 250                          # NGO→HKG 所要時間（分）
+TZ_DIFF_MIN = 60                                  # 香港時間 → 日本時間 の時差（分）
 
 
 
-# ---------------------------------------------------------------- 設定
+# ======================================================================================#
+# 設定読み込み
+# ======================================================================================#
+
+# ======================================================================================#
+# @function name:   load_dotenv
+# @function start
 def load_dotenv(path: Path) -> None:
+    """
+    ----------------------------------------------------------------------
+    関数概要：軽量な .env 読み込み（python-dotenv 不要）
+    - 既存の環境変数は上書きしない
+    - 空行・コメント行・"=" を含まない行は無視
+    ----------------------------------------------------------------------
+    Args:
+        - path -> Path --- .env ファイルのパス
+    ----------------------------------------------------------------------
+    Returns:
+        - なし
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     if not path.exists():
         return
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -61,7 +123,31 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+# @function name:   load_dotenv
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   _color
+# @function start
 def _color(env_name: str, default: int) -> int:
+    """
+    ----------------------------------------------------------------------
+    関数概要：環境変数から埋め込みの色（16 進）を取得する
+    ----------------------------------------------------------------------
+    Args:
+        - env_name -> str --- 環境変数名
+        - default -> int --- 未設定・不正時の既定値
+    ----------------------------------------------------------------------
+    Returns:
+        - color -> int --- 色コード
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     v = os.environ.get(env_name, "").strip().lstrip("#")
     try:
         return int(v, 16) if v else default
@@ -69,8 +155,37 @@ def _color(env_name: str, default: int) -> int:
         return default
 
 
-# ---------------------------------------------------------------- 取得
+# @function name:   _color
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# 便情報取得
+# ======================================================================================#
+
+# ======================================================================================#
+# @function name:   fetch_for_date
+# @function start
 def fetch_for_date(session: requests.Session, date: str, flight_type: str) -> list | None:
+    """
+    ----------------------------------------------------------------------
+    関数概要：1 日・1 方向分の便情報を API から取得する
+    - PARAM_TEMPLATES を順に試し、200 が返った最初の結果を返す
+    ----------------------------------------------------------------------
+    Args:
+        - session -> requests.Session --- HTTP セッション
+        - date -> str --- 対象日（YYYY-MM-DD）
+        - flight_type -> str --- 方向（"dep" / "arr"）
+    ----------------------------------------------------------------------
+    Returns:
+        - data -> list | None --- API レスポンス（日付ブロックのリスト）。全テンプレート失敗時は None
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     for tmpl in PARAM_TEMPLATES:
         url = f"{BASE_URL}?{tmpl.format(type=flight_type, date=date)}"
         try:
@@ -82,13 +197,62 @@ def fetch_for_date(session: requests.Session, date: str, flight_type: str) -> li
     return None
 
 
+# @function name:   fetch_for_date
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   _hit
+# @function start
 def _hit(*parts) -> bool:
+    """
+    ----------------------------------------------------------------------
+    関数概要：与えられた文字列群に名古屋を示す語・コードが含まれるか判定する
+    ----------------------------------------------------------------------
+    Args:
+        - *parts --- 判定対象の文字列（None・空は無視）
+    ----------------------------------------------------------------------
+    Returns:
+        - is_hit -> bool --- 名古屋関連ならば True
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     hay = " ".join(str(p) for p in parts if p).lower()
     toks = set(re.split(r"[\s(),/]+", hay))
     return any(w in hay for w in NAGOYA_WORDS) or NAGOYA_CODE in toks
 
 
+# @function name:   _hit
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   extract_nagoya_flights
+# @function start
 def extract_nagoya_flights(data: list, flight_type: str) -> list[dict]:
+    """
+    ----------------------------------------------------------------------
+    関数概要：API レスポンスから名古屋関連便のみを抽出する
+    - 出発便は destination、到着便は origin を判定対象にする
+    - 各便に取得日（date）と方向（_type）を付加する
+    ----------------------------------------------------------------------
+    Args:
+        - data -> list --- API レスポンス（日付ブロックのリスト）
+        - flight_type -> str --- 方向（"dep" / "arr"）
+    ----------------------------------------------------------------------
+    Returns:
+        - results -> list[dict] --- 名古屋関連便のリスト
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     results = []
     for date_block in data or []:
         date_str = date_block.get("date", "")
@@ -100,11 +264,39 @@ def extract_nagoya_flights(data: list, flight_type: str) -> list[dict]:
     return results
 
 
+# @function name:   extract_nagoya_flights
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   fetch_all
+# @function start
 def fetch_all(session: requests.Session, flight_type: str, dates: list[str]) -> list[dict]:
-    """対象日を並列取得し、Nagoya 便のみ返す"""
+    """
+    ----------------------------------------------------------------------
+    関数概要：対象日を並列取得し、Nagoya 便のみ返す
+    - 取得失敗日は警告を出して省略
+    - 取得日・時刻・便名で重複を除去し、日付・時刻順にソート
+    ----------------------------------------------------------------------
+    Args:
+        - session -> requests.Session --- HTTP セッション
+        - flight_type -> str --- 方向（"dep" / "arr"）
+        - dates -> list[str] --- 対象日のリスト（YYYY-MM-DD）
+    ----------------------------------------------------------------------
+    Returns:
+        - uniq -> list[dict] --- 名古屋関連便のリスト（重複除去・ソート済み）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     direction = "出発" if flight_type == "dep" else "到着"
+    # 並列取得
     with ThreadPoolExecutor(max_workers=min(4, len(dates))) as ex:
         pages = list(ex.map(lambda d: fetch_for_date(session, d, flight_type), dates))
+    # 名古屋関連便の抽出
     results: list[dict] = []
     for date, data in zip(dates, pages):
         if data is None:
@@ -113,6 +305,7 @@ def fetch_all(session: requests.Session, flight_type: str, dates: list[str]) -> 
         flights = extract_nagoya_flights(data, flight_type)
         print(f"  [{date}] Nagoya {direction}: {len(flights)} 件")
         results.extend(flights)
+    # 重複除去・ソート
     seen, uniq = set(), []
     for f in results:
         key = (f["date"], f.get("time"), tuple(x.get("no") for x in f.get("flight", [])))
@@ -123,8 +316,36 @@ def fetch_all(session: requests.Session, flight_type: str, dates: list[str]) -> 
     return uniq
 
 
-# ---------------------------------------------------------------- 整形
+# @function name:   fetch_all
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# 整形
+# ======================================================================================#
+
+# ======================================================================================#
+# @function name:   day_label
+# @function start
 def day_label(date_str: str, today: dt.date) -> str:
+    """
+    ----------------------------------------------------------------------
+    関数概要：日付文字列を相対表記付きのラベルに整形する
+    - 例: '今日 11/08 (日)' / '明日 11/09 (月)' / '11/12 (木)'
+    ----------------------------------------------------------------------
+    Args:
+        - date_str -> str --- 対象日（YYYY-MM-DD）
+        - today -> dt.date --- 基準日
+    ----------------------------------------------------------------------
+    Returns:
+        - label -> str --- 整形後ラベル（変換不能時は入力をそのまま返す）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     try:
         d = dt.date.fromisoformat(date_str[:10])
     except ValueError:
@@ -134,7 +355,32 @@ def day_label(date_str: str, today: dt.date) -> str:
     return f"{rel} {base}" if rel else base
 
 
+# @function name:   day_label
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   flight_code
+# @function start
 def flight_code(flight: dict) -> str:
+    """
+    ----------------------------------------------------------------------
+    関数概要：航空会社コードと便名の間にスペースを入れた表示用便名を返す
+    - 例: 'CX2088' → 'CX 2088'
+    - 共同運航などで便名が複数ある場合は先頭の便名に '+' を付ける
+    ----------------------------------------------------------------------
+    Args:
+        - flight -> dict --- 便情報
+    ----------------------------------------------------------------------
+    Returns:
+        - code -> str --- 表示用便名（便名無しは '?'）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     nos = [x.get("no", "").strip() for x in flight.get("flight", []) if x.get("no")]
     if not nos:
         return "?"
@@ -144,7 +390,31 @@ def flight_code(flight: dict) -> str:
     return code if len(nos) == 1 else f"{code}+"
 
 
+# @function name:   flight_code
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   parse_dt
+# @function start
 def parse_dt(date_str: str, hhmm: str | None) -> dt.datetime | None:
+    """
+    ----------------------------------------------------------------------
+    関数概要：日付文字列と HH:MM を含む文字列から datetime を生成する
+    ----------------------------------------------------------------------
+    Args:
+        - date_str -> str --- 対象日（YYYY-MM-DD）
+        - hhmm -> str | None --- HH:MM を含む文字列（例: 'Dep 04:37'）
+    ----------------------------------------------------------------------
+    Returns:
+        - datetime -> dt.datetime | None --- 変換結果（変換不能時は None）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     if not hhmm:
         return None
     m = re.search(r"(\d{1,2}):(\d{2})", hhmm)
@@ -156,9 +426,33 @@ def parse_dt(date_str: str, hhmm: str | None) -> dt.datetime | None:
         return None
 
 
+# @function name:   parse_dt
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   parse_status
+# @function start
 def parse_status(flight: dict, sched_dt: dt.datetime | None) -> tuple[str, dt.datetime | None, bool]:
-    """HKG の status 文字列 → (日本語状態, 実績 or 変更後時刻, 欠航か)
-    例: 'Dep 04:37' → ('出発済 04:37', 04:37, False) / 'Est at 05:20' → ('変更 05:20', 05:20, False)
+    """
+    ----------------------------------------------------------------------
+    関数概要：HKG の status 文字列を (日本語状態, 実績 or 変更後時刻, 欠航か) に変換する
+    - 例: 'Dep 04:37' → ('出発済 04:37', 04:37, False)
+          'Est at 05:20' → ('変更 05:20', 05:20, False)
+    - 日付をまたぐ実績（例: 23:50 予定 → 00:10 実績）は翌日扱い
+    ----------------------------------------------------------------------
+    Args:
+        - flight -> dict --- 便情報
+        - sched_dt -> dt.datetime | None --- 予定時刻
+    ----------------------------------------------------------------------
+    Returns:
+        - (status, t, cancelled) -> tuple[str, dt.datetime | None, bool] --- 内部状態、実績/変更後時刻、欠航フラグ
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
     """
     is_dep = flight.get("_type") == "dep"
     raw = (flight.get("status") or "").strip()
@@ -184,7 +478,33 @@ def parse_status(flight: dict, sched_dt: dt.datetime | None) -> tuple[str, dt.da
     return raw, t, False
 
 
+# @function name:   parse_status
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   _hhmm_rel
+# @function start
 def _hhmm_rel(t: dt.datetime | None, ref_date: dt.date | None, approx: bool) -> str:
+    """
+    ----------------------------------------------------------------------
+    関数概要：時刻を基準日との日差と推定マーク付きで整形する
+    - 例: '12:17*' / '04:15*+1' / '18:10-1'
+    ----------------------------------------------------------------------
+    Args:
+        - t -> dt.datetime | None --- 対象時刻
+        - ref_date -> dt.date | None --- 基準日（日差計算用）
+        - approx -> bool --- 推定値かどうか（True なら "*" を付ける）
+    ----------------------------------------------------------------------
+    Returns:
+        - text -> str --- 整形後文字列（None の場合は '--:--'）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     if t is None:
         return "--:--"
     s = f"{t:%H:%M}" + ("*" if approx else "")
@@ -195,15 +515,62 @@ def _hhmm_rel(t: dt.datetime | None, ref_date: dt.date | None, approx: bool) -> 
     return s
 
 
+# @function name:   _hhmm_rel
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   fmt_md
+# @function start
 def fmt_md(d) -> str:
-    """11/09(月) 形式"""
+    """
+    ----------------------------------------------------------------------
+    関数概要：日付を '11/09(月)' 形式に整形する
+    ----------------------------------------------------------------------
+    Args:
+        - d -> dt.datetime | dt.date | None --- 対象日付
+    ----------------------------------------------------------------------
+    Returns:
+        - text -> str --- 整形後文字列（None の場合は '--/--'）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     if d is None:
         return "--/--"
     return f"{d:%m/%d}({WEEKDAY_JA[d.weekday()]})"
 
 
+# @function name:   fmt_md
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   _mins_diff
+# @function start
 def _mins_diff(a: str, b: str):
-    """'04:37' - '04:35' → +2（日またぎは ±12h 以内で補正）"""
+    """
+    ----------------------------------------------------------------------
+    関数概要：2 つの HH:MM の差分（分）を求める
+    - 例: '04:37' - '04:35' → +2
+    - 日またぎは ±12h 以内で補正
+    ----------------------------------------------------------------------
+    Args:
+        - a -> str --- 時刻（HH:MM）
+        - b -> str --- 基準時刻（HH:MM）
+    ----------------------------------------------------------------------
+    Returns:
+        - minutes -> int | None --- a - b の分差（変換不能時は None）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     try:
         ha, ma = map(int, a[:5].split(":")); hb, mb = map(int, b[:5].split(":"))
     except ValueError:
@@ -216,19 +583,51 @@ def _mins_diff(a: str, b: str):
     return d
 
 
+# @function name:   _mins_diff
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   pretty_status
+# @function start
 def pretty_status(status: str, sched_txt: str, is_dep: bool, prev_status, prev_sched, kind: str) -> str:
-    """内部状態（'定刻' / '出発済 04:37' / '変更 05:20' / '遅延' / '欠航' / その他）→ 見やすい 1 行
-    例: ✅ 出発済み 04:37（予定 04:35、+2分） / 🟡 時刻変更 → 05:20（予定 04:35、+45分） / 🟢 定刻どおり
+    """
+    ----------------------------------------------------------------------
+    関数概要：内部状態を見やすい表示行に変換する
+    - 入力: '定刻' / '出発済 04:37' / '変更 05:20' / '遅延' / '欠航' / その他
+    - 例: ✅ 出発済み 04:37（予定 04:35、+2分）
+          🟡 時刻変更 → 05:20（予定 04:35、+45分）
+          🟢 定刻どおり
+    - 新規・変化がある場合は 2 行目に 🆕 / 🔔 の補足を付ける
+    ----------------------------------------------------------------------
+    Args:
+        - status -> str --- 内部状態文字列（parse_status の戻り値）
+        - sched_txt -> str --- 予定時刻（HH:MM）
+        - is_dep -> bool --- 出発便かどうか
+        - prev_status -> str | None --- 前回通知時の状態
+        - prev_sched -> str | None --- 前回通知時の予定時刻
+        - kind -> str --- 変化種別（"" / "new" / "changed"）
+    ----------------------------------------------------------------------
+    Returns:
+        - line -> str --- 表示用文字列（1〜2 行）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
     """
     s = status.strip()
     tag = "出発" if is_dep else "到着"
 
+    # 予定時刻との差分を '、+N分' / '、定刻' 形式で返す
     def delta(t: str) -> str:
         d = _mins_diff(t, sched_txt)
         if d is None:
             return ""
         return "、定刻" if d == 0 else f"、{d:+d}分"
 
+    # 状態別の 1 行目
     if s == "定刻":
         line = "🟢 定刻どおり"
     elif s.startswith(("出発済", "到着済")):
@@ -244,6 +643,7 @@ def pretty_status(status: str, sched_txt: str, is_dep: bool, prev_status, prev_s
     else:
         line = f"🔵 {s}"
 
+    # 新規・変化の補足（2 行目）
     if kind == "new":
         line += "\n🆕 新しく追加された便"
     elif kind == "changed":
@@ -254,8 +654,31 @@ def pretty_status(status: str, sched_txt: str, is_dep: bool, prev_status, prev_s
     return line
 
 
+# @function name:   pretty_status
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   ngo_time_suffix
+# @function start
 def ngo_time_suffix(txt: str) -> str:
-    """'05:40*+1' → ' (翌日・推定)'"""
+    """
+    ----------------------------------------------------------------------
+    関数概要：名古屋側時刻文字列の日差・推定マークを日本語の補足に変換する
+    - 例: '05:40*+1' → ' (翌日・推定)'
+    ----------------------------------------------------------------------
+    Args:
+        - txt -> str --- _hhmm_rel で整形した時刻文字列
+    ----------------------------------------------------------------------
+    Returns:
+        - suffix -> str --- 補足文字列（補足なしの場合は空文字）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     parts = []
     if "+1" in txt:
         parts.append("翌日")
@@ -268,8 +691,38 @@ def ngo_time_suffix(txt: str) -> str:
     return f" ({'・'.join(parts)})" if parts else ""
 
 
+# @function name:   ngo_time_suffix
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   describe
+# @function start
 def describe(flight: dict, today: dt.date, prev: dict | None) -> tuple[dict, dict, str]:
-    """1 便 = 埋め込みフィールド 1 枠。戻り値: (field, 署名, 変化種別 ""/"new"/"changed")"""
+    """
+    ----------------------------------------------------------------------
+    関数概要：1 便を Discord 埋め込みフィールド 1 枠に整形する
+    - name : 🛫 CX 2088 ｜ 今日 11/08 (日)
+    - value: HKG → NGO
+             `🛫 HKG 11/08(日) 04:35 HKT`
+             `🛬 NGO 11/08(日) 09:15 JST (推定)`
+             ✅ 出発済み 04:37（予定 04:35、+2分）
+    ----------------------------------------------------------------------
+    Args:
+        - flight -> dict --- 便情報
+        - today -> dt.date --- 基準日（相対日付ラベル用）
+        - prev -> dict | None --- 前回通知時の署名（無ければ新規扱い）
+    ----------------------------------------------------------------------
+    Returns:
+        - (field, sig, kind) -> tuple[dict, dict, str] --- 埋め込みフィールド、署名、変化種別（"" / "new" / "changed"）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
+    # 予定時刻・状態の算出
     is_dep = flight.get("_type") == "dep"
     date_str = flight.get("date", "")
     sched_dt = parse_dt(date_str, flight.get("time"))
@@ -277,6 +730,7 @@ def describe(flight: dict, today: dt.date, prev: dict | None) -> tuple[dict, dic
     ref = sched_dt.date() if sched_dt else None
     status, eff_dt, cancelled = parse_status(flight, sched_dt)
 
+    # 名古屋側の時刻（標準所要時間 + 時差 からの推定）
     base = eff_dt or sched_dt
     if cancelled or base is None:
         ngo_dt = None
@@ -286,6 +740,7 @@ def describe(flight: dict, today: dt.date, prev: dict | None) -> tuple[dict, dic
         ngo_dt = base - dt.timedelta(minutes=FLIGHT_MIN_NGO_HKG - TZ_DIFF_MIN)
     ngo_txt = _hhmm_rel(ngo_dt, ref, True)
 
+    # 経路表記（名古屋以外の経由地・目的地があれば付加）
     ports = (flight.get("destination") if is_dep else flight.get("origin")) or []
     others = [p for p in ports if not _hit(p)]
     if is_dep:
@@ -294,6 +749,7 @@ def describe(flight: dict, today: dt.date, prev: dict | None) -> tuple[dict, dic
         route_text = (f"{others[0]} → " if others else "") + "NGO → HKG"
     DATE_STR = date_str
 
+    # 前回通知との比較（署名 = 予定時刻 + 状態）
     sig = {"sched": sched_txt, "status": status}
     mark = " "
     kind = ""
@@ -316,15 +772,66 @@ def describe(flight: dict, today: dt.date, prev: dict | None) -> tuple[dict, dic
         times = [f"`🛫 {ngo_line}`", f"`🛬 {hkg_line}`"]
     value = "\n".join([route_text, *times, status_disp])
     kind = {"+": "new", "!": "changed"}.get(mark, "")
-    return {"name": name[:256], "value": value[:1024], "inline": False}, sig, kind
+    return {"name": name[:256], "value": value[:1024], "inline": False}, sig, kind  # Discord の文字数上限で切り詰め
 
 
+# @function name:   describe
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   flight_key
+# @function start
 def flight_key(flight: dict) -> str:
+    """
+    ----------------------------------------------------------------------
+    関数概要：前回状態の保存・照合に使う便の一意キーを生成する
+    - 形式: '<_type>_<date>_<便名1/便名2/...>'
+    ----------------------------------------------------------------------
+    Args:
+        - flight -> dict --- 便情報
+    ----------------------------------------------------------------------
+    Returns:
+        - key -> str --- 一意キー
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     nos = "/".join(x.get("no", "") for x in flight.get("flight", []))
     return f"{flight.get('_type')}_{flight.get('date')}_{nos}"
 
 
+# @function name:   flight_key
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   build_fields
+# @function start
 def build_fields(flights: list[dict], today: dt.date, state: dict, new_state: dict) -> tuple[list[dict], int]:
+    """
+    ----------------------------------------------------------------------
+    関数概要：便ごとの埋め込みフィールド一覧と変化件数を求める
+    - new_state に今回の署名を書き込む（副作用）
+    ----------------------------------------------------------------------
+    Args:
+        - flights -> list[dict] --- 便情報リスト
+        - today -> dt.date --- 基準日
+        - state -> dict --- 前回通知状態（便キー → 署名）
+        - new_state -> dict --- 今回の通知状態を書き込む辞書（更新される）
+    ----------------------------------------------------------------------
+    Returns:
+        - (fields, changed) -> tuple[list[dict], int] --- フィールド一覧と変化件数
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     fields, changed = [], 0
     for f in flights:
         key = flight_key(f)
@@ -336,37 +843,148 @@ def build_fields(flights: list[dict], today: dt.date, state: dict, new_state: di
     return fields, changed
 
 
+# @function name:   build_fields
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   strip_new_badges
+# @function start
 def strip_new_badges(fields: list[dict]) -> list[dict]:
+    """
+    ----------------------------------------------------------------------
+    関数概要：フィールドから 🆕 の印を取り除く
+    - 初回実行時（前回状態なし）は全件が新規になるので印を消す
+    ----------------------------------------------------------------------
+    Args:
+        - fields -> list[dict] --- 埋め込みフィールド一覧
+    ----------------------------------------------------------------------
+    Returns:
+        - fields -> list[dict] --- 印を取り除いた新しいフィールド一覧
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     return [{**f, "name": f["name"].replace("🆕 ", ""), "value": f["value"].replace("\n🆕 新しく追加された便", "")} for f in fields]
 
 
+# @function name:   strip_new_badges
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   fields_to_text
+# @function start
 def fields_to_text(fields: list[dict]) -> str:
+    """
+    ----------------------------------------------------------------------
+    関数概要：埋め込みフィールド一覧を標準出力用のテキストに変換する
+    ----------------------------------------------------------------------
+    Args:
+        - fields -> list[dict] --- 埋め込みフィールド一覧
+    ----------------------------------------------------------------------
+    Returns:
+        - text -> str --- 表示用テキスト（0 件の場合は '  該当便なし'）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     if not fields:
         return "  該当便なし"
     out = []
     for f in fields:
-        if f["value"] == "\u200b":
+        if f["value"] == "​":
             out.append(f" {f['name']}")
         else:
             out.append(f"  {f['name']}\n" + "\n".join("    " + l for l in f["value"].splitlines()))
     return "\n".join(out)
 
 
-# ---------------------------------------------------------------- Discord
+# @function name:   fields_to_text
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# Discord 通知
+# ======================================================================================#
+
+# ======================================================================================#
+# @function name:   _embeds
+# @function start
 def _embeds(title: str, fields: list[dict], color: int) -> list[dict]:
+    """
+    ----------------------------------------------------------------------
+    関数概要：フィールド一覧を Discord 埋め込みに分割して組み立てる
+    - 1 埋め込みあたり 25 フィールド上限のため 24 件ずつ分割
+    ----------------------------------------------------------------------
+    Args:
+        - title -> str --- 埋め込みタイトル
+        - fields -> list[dict] --- 埋め込みフィールド一覧
+        - color -> int --- 埋め込みの色
+    ----------------------------------------------------------------------
+    Returns:
+        - embeds -> list[dict] --- 埋め込みリスト（0 件の場合は '該当便なし' の 1 件）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     if not fields:
         return [{"title": title, "description": "該当便なし", "color": color}]
     return [{"title": title if i == 0 else f"{title} (続き)", "color": color, "fields": fields[i:i + 24]}
             for i in range(0, len(fields), 24)]
 
 
+# @function name:   _embeds
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   post_discord
+# @function start
 def post_discord(webhook: str, title: str, period: str, dep_fields: list[dict], arr_fields: list[dict],
                  n_dep: int, n_arr: int, n_changed: int) -> None:
+    """
+    ----------------------------------------------------------------------
+    関数概要：Discord Webhook へ出発便・到着便の埋め込みを送信する
+    - 1 メッセージあたり 10 埋め込み上限のため分割送信
+    - 429 (Rate Limit) 時は Retry-After 秒待って 1 回再送
+    ----------------------------------------------------------------------
+    Args:
+        - webhook -> str --- Discord Webhook URL
+        - title -> str --- メッセージタイトル
+        - period -> str --- 対象期間の表示文字列
+        - dep_fields -> list[dict] --- 出発便フィールド一覧
+        - arr_fields -> list[dict] --- 到着便フィールド一覧
+        - n_dep -> int --- 出発便件数
+        - n_arr -> int --- 到着便件数
+        - n_changed -> int --- 前回からの変化件数
+    ----------------------------------------------------------------------
+    Returns:
+        - なし
+    ----------------------------------------------------------------------
+    Raises:
+        - requests.HTTPError --- 送信に失敗した場合
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     embeds = _embeds(f"出発便  HKG → NGO  ({n_dep} 件)", dep_fields, _color("DISCORD_COLOR_DEP", 0x3B82F6)) + \
              _embeds(f"到着便  NGO → HKG  ({n_arr} 件)", arr_fields, _color("DISCORD_COLOR_ARR", 0x22C55E))
     embeds[-1]["footer"] = {"text": f"HKT=香港時間 / JST=日本時間 ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {dt.datetime.now():%m/%d %H:%M} JST"}
     chg = f"  ・ 変化 {n_changed} 件" if n_changed else ""
-    for i in range(0, len(embeds), 10):
+    for i in range(0, len(embeds), 10):  # 10 embeds/message 上限
         payload = {"embeds": embeds[i:i + 10]}
         if i == 0:
             payload["content"] = f"**{title}**{chg}\n対象期間: {period}"
@@ -377,7 +995,30 @@ def post_discord(webhook: str, title: str, period: str, dep_fields: list[dict], 
         r.raise_for_status()
 
 
+# @function name:   post_discord
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# @function name:   load_state
+# @function start
 def load_state() -> dict:
+    """
+    ----------------------------------------------------------------------
+    関数概要：前回通知状態を JSON ファイルから読み込む
+    ----------------------------------------------------------------------
+    Args:
+        - なし
+    ----------------------------------------------------------------------
+    Returns:
+        - state -> dict --- 前回通知状態（ファイル無し・破損時は空辞書）
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -386,13 +1027,49 @@ def load_state() -> dict:
     return {}
 
 
-# ---------------------------------------------------------------- main
+# @function name:   load_state
+# @function end
+# ======================================================================================#
+
+
+# ======================================================================================#
+# メイン処理
+# ======================================================================================#
+
+# ======================================================================================#
+# @function name:   main
+# @function start
 def main() -> int:
+    """
+    ----------------------------------------------------------------------
+    関数概要：HKG カーゴ便から名古屋発着便を取得して Discord へ通知するメイン処理
+    - .env 読み込み・引数解析
+    - 出発便・到着便を並列取得
+    - 前回状態との比較・標準出力表示
+    - Discord 送信（--dry-run / --only-new / --notify-empty で制御）
+    - 送信成功時に通知状態を保存
+    ----------------------------------------------------------------------
+    Args:
+        - なし
+    ----------------------------------------------------------------------
+    Returns:
+        - exit_code -> int --- 終了コード
+            0: 正常終了（スキップ含む）
+            3: Webhook URL 未設定
+            4: Discord 送信失敗
+    ----------------------------------------------------------------------
+    Notes:
+        - author         Kidera-Shunsuke
+        - revision       v1.00 (2026/11/08) - 新規作成
+    ----------------------------------------------------------------------
+    """
+    # .env 読み込みと所要時間設定の再評価（.env の値を反映）
     global FLIGHT_MIN_HKG_NGO, FLIGHT_MIN_NGO_HKG
     load_dotenv(BASE_DIR / ".env")
     FLIGHT_MIN_HKG_NGO = int(os.environ.get("FLIGHT_MINUTES_HKG_NGO", FLIGHT_MIN_HKG_NGO))
     FLIGHT_MIN_NGO_HKG = int(os.environ.get("FLIGHT_MINUTES_NGO_HKG", FLIGHT_MIN_NGO_HKG))
 
+    # コマンドライン引数
     p = argparse.ArgumentParser(description="HKG カーゴ便から名古屋発着便を Discord へ通知")
     p.add_argument("--date", help="起点日 YYYY-MM-DD（既定: 今日）")
     p.add_argument("--days", type=int, default=3, help="取得する日数（既定 3）")
@@ -403,9 +1080,11 @@ def main() -> int:
     p.add_argument("--reset-state", action="store_true", help="前回状態を無視する（全件を新規扱い）")
     a = p.parse_args()
 
+    # 対象日の決定
     today = dt.date.fromisoformat(a.date) if a.date else dt.date.today()
     dates = [(today + dt.timedelta(days=i)).isoformat() for i in range(max(1, a.days))]
 
+    # 出発便・到着便を並列取得
     session = requests.Session()
     session.headers.update(HEADERS)
     t0 = time.perf_counter()
@@ -415,6 +1094,7 @@ def main() -> int:
         dep, arr = f_dep.result(), f_arr.result()
     print(f"取得 {time.perf_counter() - t0:.1f}s")
 
+    # 前回状態との比較・フィールド組み立て
     state = {} if a.reset_state else load_state()
     new_state: dict = {}
     dep_fields, c1 = build_fields(dep, today, state, new_state)
@@ -423,6 +1103,7 @@ def main() -> int:
     if not state:
         dep_fields, arr_fields = strip_new_badges(dep_fields), strip_new_badges(arr_fields)
 
+    # 標準出力表示
     period = f"{day_label(dates[0], today)} 〜 {day_label(dates[-1], today)}"
     title = f"HKG ⇄ NGO カーゴ便  |  出発 {len(dep)} 件 / 到着 {len(arr)} 件"
     print(title, f"(変化 {n_changed} 件)" if n_changed else "")
@@ -430,6 +1111,7 @@ def main() -> int:
     print("[出発便 HKG → NGO]"); print(fields_to_text(dep_fields))
     print("[到着便 NGO → HKG]"); print(fields_to_text(arr_fields))
 
+    # 送信スキップ判定
     if a.dry_run:
         return 0
     if not (dep or arr) and not a.notify_empty:
@@ -439,6 +1121,7 @@ def main() -> int:
         print("前回通知から変化なしのためスキップ")
         return 0
 
+    # Discord 送信
     webhook = a.webhook or os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook:
         print("[ERROR] DISCORD_WEBHOOK_URL が未設定です（.env か環境変数で指定）", file=sys.stderr)
@@ -455,5 +1138,11 @@ def main() -> int:
     return 0
 
 
+# @function name:   main
+# @function end
+# ======================================================================================#
+
+
 if __name__ == "__main__":
+    # 独立実行時の処理
     sys.exit(main())
