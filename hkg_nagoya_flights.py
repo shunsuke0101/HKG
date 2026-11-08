@@ -1,58 +1,76 @@
-﻿"""
-香港国際空港（HKG）カーゴフライト（出発・到着）の Nagoya (NGO) 便を抽出するスクリプト
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+香港国際空港（HKG）カーゴフライト（出発・到着）の Nagoya (NGO) 便を抽出して Discord に通知する。
+表示は Changi / 仁川 の通知と共通の表形式。
 
+使い方:
+    python hkg_nagoya_flights.py              # 3 日分を取得して Discord へ通知
+    python hkg_nagoya_flights.py --dry-run    # 送信せず表示のみ
+    python hkg_nagoya_flights.py --only-new   # 前回通知から変化が無ければ送らない
+
+前回通知からの変化（実績時刻が入った、予定が変わった、新しい便 など）は行頭に「!」を付け、
+状態欄に「←前回値」を添えて目立たせる。状態は notified_state.json に保存。
+"""
+import argparse
+import datetime as dt
+import json
 import os
-import requests
-from datetime import datetime, timedelta
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# 定数
-# ---------------------------------------------------------------------------
+import requests
+
+BASE_DIR = Path(__file__).resolve().parent
+STATE_FILE = BASE_DIR / "notified_state.json"
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.hongkongairport.com/en/flights/departures/cargo.page",
 }
-
 BASE_URL = "https://www.hongkongairport.com/flightinfo-rest/rest/flights"
-
-NAGOYA_KEYWORDS = ["nagoya", "ngo", "中部"]
-
-# 今日・明日・明後日
-TARGET_DATES = [
-    (datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d")
-    for i in range(3)
-]
-
-DATE_LABELS = {
-    TARGET_DATES[0]: "今日",
-    TARGET_DATES[1]: "明日",
-    TARGET_DATES[2]: "明後日",
-}
-
-# Discord Webhook URL（環境変数 DISCORD_WEBHOOK_URL から取得）
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1482606854541676664/7vIH3CSM4lHG7tuMsPvrds263kxlfo9BEdur6EtEo37lLkyqqnrZYtEUXwvn4GXokjaL"
-
-# API パラメータ候補（上から順に試す）
 PARAM_TEMPLATES = [
     "type={type}&cargo=true&lang=en&date={date}",
     "type={type}&cargo=Y&lang=en&date={date}",
 ]
+NAGOYA_WORDS = ("nagoya", "chubu", "centrair", "中部")
+NAGOYA_CODE = "ngo"
+WEEKDAY_JA = "月火水木金土日"
 
-# ---------------------------------------------------------------------------
-# データ取得
-# ---------------------------------------------------------------------------
+# 名古屋側時刻の推定に使う標準所要時間（分）。香港 UTC+8 → 日本 UTC+9 なので +1h
+FLIGHT_MIN_HKG_NGO = 220
+FLIGHT_MIN_NGO_HKG = 250
+TZ_DIFF_MIN = 60
 
 
+
+# ---------------------------------------------------------------- 設定
+def load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def _color(env_name: str, default: int) -> int:
+    v = os.environ.get(env_name, "").strip().lstrip("#")
+    try:
+        return int(v, 16) if v else default
+    except ValueError:
+        return default
+
+
+# ---------------------------------------------------------------- 取得
 def fetch_for_date(session: requests.Session, date: str, flight_type: str) -> list | None:
-    """指定日・種別 (dep/arr) のカーゴフライト JSON を取得して返す。失敗時は None。"""
     for tmpl in PARAM_TEMPLATES:
         url = f"{BASE_URL}?{tmpl.format(type=flight_type, date=date)}"
         try:
@@ -64,162 +82,335 @@ def fetch_for_date(session: requests.Session, date: str, flight_type: str) -> li
     return None
 
 
-# ---------------------------------------------------------------------------
-# フィルタリング・整形
-# ---------------------------------------------------------------------------
+def _hit(*parts) -> bool:
+    hay = " ".join(str(p) for p in parts if p).lower()
+    toks = set(re.split(r"[\s(),/]+", hay))
+    return any(w in hay for w in NAGOYA_WORDS) or NAGOYA_CODE in toks
 
 
 def extract_nagoya_flights(data: list, flight_type: str) -> list[dict]:
-    """JSON データから Nagoya (NGO) 発着フライトを抽出して返す。
-
-    dep → destination フィールドで検索
-    arr → origin フィールドで検索
-    """
     results = []
-    for date_block in data:
+    for date_block in data or []:
         date_str = date_block.get("date", "")
         for flight in date_block.get("list", []):
-            targets = (
-                flight.get("origin", [])
-                if flight_type == "arr"
-                else flight.get("destination", []) or flight.get("dest", [])
-            ) or []
-            if any(kw in " ".join(targets).lower() for kw in NAGOYA_KEYWORDS):
+            targets = (flight.get("origin") if flight_type == "arr"
+                       else flight.get("destination") or flight.get("dest")) or []
+            if _hit(*targets):
                 results.append({"date": date_str, "_type": flight_type, **flight})
     return results
 
 
-def format_flight(flight: dict) -> str:
-    """フライト辞書を読みやすい文字列に整形して返す。"""
-    flight_nos = ", ".join(f["no"] for f in flight.get("flight", []))
-    airlines   = ", ".join(f.get("airline", "") for f in flight.get("flight", []))
-    dest       = ", ".join(flight.get("destination", [])) or "-"
-    origin     = ", ".join(flight.get("origin", [])) or "-"
-    ftype      = "出発" if flight.get("_type") == "dep" else "到着"
-    return "\n".join([
-        f"  種別      : {ftype}",
-        f"  日付      : {flight.get('date', '-')}",
-        f"  時刻      : {flight.get('time', '-')}",
-        f"  便名      : {flight_nos}",
-        f"  航空会社  : {airlines}",
-        f"  出発地    : {origin}",
-        f"  目的地    : {dest}",
-        f"  ステータス: {flight.get('status', '-')}",
-    ])
-
-
-# ---------------------------------------------------------------------------
-# Discord 通知
-# ---------------------------------------------------------------------------
-
-
-def _flights_to_embed(flights: list[dict], ftype: str) -> dict:
-    """フライト一覧を1つの Discord Embed にまとめる。"""
-    color = 0x00BFFF if ftype == "dep" else 0xFF8C00
-    label = "出発 (HKG→NGO)" if ftype == "dep" else "到着 (NGO→HKG)"
-    if not flights:
-        desc = "該当なし"
-    else:
-        lines = []
-        for f in flights:
-            nos        = " ".join(x["no"] for x in f.get("flight", []))
-            date_label = DATE_LABELS.get(f.get("date", ""), "")
-            date_str   = f.get("date", "-")
-            status     = f.get("status") or "-"
-            lines.append(f"{nos}  {date_label}({date_str}) {f.get('time', '-')}  [{status}]")
-        desc = "\n".join(lines)
-    return {"title": label, "color": color, "description": desc}
-
-
-def notify_discord(dep_flights: list[dict], arr_flights: list[dict]) -> None:
-    """出発・到着フライト情報を Discord Webhook へ送信する。"""
-    if not DISCORD_WEBHOOK_URL:
-        print("[Discord] DISCORD_WEBHOOK_URL が未設定のため通知をスキップします。")
-        return
-
-    all_flights = dep_flights + arr_flights
-    if not all_flights:
-        payload = {"content": "🔍 HKG カーゴ | NGO 便 該当なし"}
-    else:
-        embeds = [
-            _flights_to_embed(dep_flights, "dep"),
-            _flights_to_embed(arr_flights, "arr"),
-        ]
-        payload = {
-            "content": f"✈ **HKG カーゴ NGO 便** | 出発 {len(dep_flights)} 件 / 到着 {len(arr_flights)} 件",
-            "embeds": embeds,
-        }
-
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        if resp.status_code in (200, 204):
-            print(f"[Discord] 通知送信完了 ({len(all_flights)} 件)")
-        else:
-            print(f"[Discord] 送信失敗: HTTP {resp.status_code} {resp.text[:200]}")
-    except requests.RequestException as e:
-        print(f"[Discord] 送信エラー: {e}")
-
-
-# ---------------------------------------------------------------------------
-# 集計・出力
-# ---------------------------------------------------------------------------
-
-
-def fetch_all(session: requests.Session, flight_type: str) -> list[dict]:
-    """全対象日分のデータを取得し、Nagoya 便のみ返す。"""
+def fetch_all(session: requests.Session, flight_type: str, dates: list[str]) -> list[dict]:
+    """対象日を並列取得し、Nagoya 便のみ返す"""
     direction = "出発" if flight_type == "dep" else "到着"
+    with ThreadPoolExecutor(max_workers=min(4, len(dates))) as ex:
+        pages = list(ex.map(lambda d: fetch_for_date(session, d, flight_type), dates))
     results: list[dict] = []
-    for date in TARGET_DATES:
-        label = DATE_LABELS[date]
-        data = fetch_for_date(session, date, flight_type)
+    for date, data in zip(dates, pages):
         if data is None:
-            print(f"  [{label} ({date})] データ取得失敗")
+            print(f"  [{date}] {direction} データ取得失敗", file=sys.stderr)
             continue
         flights = extract_nagoya_flights(data, flight_type)
-        print(f"  [{label} ({date})] Nagoya {direction}: {len(flights)} 件")
+        print(f"  [{date}] Nagoya {direction}: {len(flights)} 件")
         results.extend(flights)
-    return results
+    seen, uniq = set(), []
+    for f in results:
+        key = (f["date"], f.get("time"), tuple(x.get("no") for x in f.get("flight", [])))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(f)
+    uniq.sort(key=lambda f: (f["date"], f.get("time") or ""))
+    return uniq
 
 
-def print_section(flights: list[dict], title: str) -> None:
-    """フライト一覧をセクション形式で標準出力に表示する。"""
-    print(f"\n{'=' * 60}")
-    print(f" {title}  合計: {len(flights)} 件")
-    print(f"{'=' * 60}")
-    if not flights:
-        print("  (該当なし)")
-        return
-    for i, flight in enumerate(flights, 1):
-        label = DATE_LABELS.get(flight.get("date", ""), "")
-        print(f"\n[{i}] {label} ({flight.get('date', '-')}) ---")
-        print(format_flight(flight))
+# ---------------------------------------------------------------- 整形
+def day_label(date_str: str, today: dt.date) -> str:
+    try:
+        d = dt.date.fromisoformat(date_str[:10])
+    except ValueError:
+        return date_str
+    rel = {-1: "昨日", 0: "今日", 1: "明日", 2: "明後日"}.get((d - today).days)
+    base = f"{d:%m/%d} ({WEEKDAY_JA[d.weekday()]})"
+    return f"{rel} {base}" if rel else base
 
 
-# ---------------------------------------------------------------------------
-# エントリポイント
-# ---------------------------------------------------------------------------
+def flight_code(flight: dict) -> str:
+    nos = [x.get("no", "").strip() for x in flight.get("flight", []) if x.get("no")]
+    if not nos:
+        return "?"
+    fn = nos[0].replace(" ", "")
+    m = re.match(r"^([A-Z][A-Z0-9]|[0-9][A-Z])(\d{1,5}[A-Z]?)$", fn.upper())
+    code = f"{m.group(1)} {m.group(2)}" if m else nos[0]
+    return code if len(nos) == 1 else f"{code}+"
 
 
-def main() -> None:
-    print("=" * 60)
-    print("香港空港 カーゴフライト Nagoya (NGO) 便 検索")
-    print(f"取得対象日: {', '.join(TARGET_DATES)}")
-    print("=" * 60)
+def parse_dt(date_str: str, hhmm: str | None) -> dt.datetime | None:
+    if not hhmm:
+        return None
+    m = re.search(r"(\d{1,2}):(\d{2})", hhmm)
+    if not m:
+        return None
+    try:
+        return dt.datetime.strptime(f"{date_str[:10]} {int(m.group(1)):02d}:{m.group(2)}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+
+
+def parse_status(flight: dict, sched_dt: dt.datetime | None) -> tuple[str, dt.datetime | None, bool]:
+    """HKG の status 文字列 → (日本語状態, 実績 or 変更後時刻, 欠航か)
+    例: 'Dep 04:37' → ('出発済 04:37', 04:37, False) / 'Est at 05:20' → ('変更 05:20', 05:20, False)
+    """
+    is_dep = flight.get("_type") == "dep"
+    raw = (flight.get("status") or "").strip()
+    s = raw.lower()
+    date_str = flight.get("date", "")
+    t = parse_dt(date_str, raw)
+    # 日付をまたぐ実績（例: 23:50 予定 → 00:10 実績）は翌日扱い
+    if t and sched_dt and (t - sched_dt).total_seconds() < -12 * 3600:
+        t += dt.timedelta(days=1)
+    tag = "出発済" if is_dep else "到着済"
+    if "cancel" in s:
+        return "欠航", None, True
+    if s.startswith("dep") or s.startswith("landed") or s.startswith("arr") or s.startswith("at gate"):
+        return (f"{tag} {t:%H:%M}" if t else tag), t, False
+    if s.startswith("est"):
+        if t and sched_dt and t != sched_dt:
+            return f"変更 {t:%H:%M}", t, False
+        return "定刻", None, False
+    if "delay" in s:
+        return "遅延", t, False
+    if not raw:
+        return "定刻", None, False
+    return raw, t, False
+
+
+def _hhmm_rel(t: dt.datetime | None, ref_date: dt.date | None, approx: bool) -> str:
+    if t is None:
+        return "--:--"
+    s = f"{t:%H:%M}" + ("*" if approx else "")
+    if ref_date:
+        diff = (t.date() - ref_date).days
+        if diff:
+            s += f"{diff:+d}"
+    return s
+
+
+def fmt_md(d) -> str:
+    """11/09(月) 形式"""
+    if d is None:
+        return "--/--"
+    return f"{d:%m/%d}({WEEKDAY_JA[d.weekday()]})"
+
+
+def ngo_time_suffix(txt: str) -> str:
+    """'05:40*+1' → ' (翌日・推定)'"""
+    parts = []
+    if "+1" in txt:
+        parts.append("翌日")
+    elif "-1" in txt:
+        parts.append("前日")
+    elif "+2" in txt:
+        parts.append("翌々日")
+    if "*" in txt:
+        parts.append("推定")
+    return f" ({'・'.join(parts)})" if parts else ""
+
+
+def describe(flight: dict, today: dt.date, prev: dict | None) -> tuple[dict, dict, str]:
+    """1 便 = 埋め込みフィールド 1 枠。戻り値: (field, 署名, 変化種別 ""/"new"/"changed")"""
+    is_dep = flight.get("_type") == "dep"
+    date_str = flight.get("date", "")
+    sched_dt = parse_dt(date_str, flight.get("time"))
+    sched_txt = f"{sched_dt:%H:%M}" if sched_dt else (flight.get("time") or "--:--")
+    ref = sched_dt.date() if sched_dt else None
+    status, eff_dt, cancelled = parse_status(flight, sched_dt)
+
+    base = eff_dt or sched_dt
+    if cancelled or base is None:
+        ngo_dt = None
+    elif is_dep:
+        ngo_dt = base + dt.timedelta(minutes=FLIGHT_MIN_HKG_NGO + TZ_DIFF_MIN)
+    else:
+        ngo_dt = base - dt.timedelta(minutes=FLIGHT_MIN_NGO_HKG - TZ_DIFF_MIN)
+    ngo_txt = _hhmm_rel(ngo_dt, ref, True)
+
+    ports = (flight.get("destination") if is_dep else flight.get("origin")) or []
+    others = [p for p in ports if not _hit(p)]
+    if is_dep:
+        route_text = "HKG → NGO" + (f" → {others[-1]}" if others else "")
+    else:
+        route_text = (f"{others[0]} → " if others else "") + "NGO → HKG"
+    DATE_STR = date_str
+
+    sig = {"sched": sched_txt, "status": status}
+    mark = " "
+    if prev is None:
+        mark = "+"
+        status_disp = status + " [新規]"
+    elif prev.get("status") != status or prev.get("sched") != sched_txt:
+        mark = "!"
+        old = prev.get("status", "?")
+        if prev.get("sched") != sched_txt:
+            old = f"{prev.get('sched')} {old}"
+        status_disp = f"{status} ←{old}"
+    else:
+        status_disp = status
+
+    # 1 便 = 埋め込みフィールド 1 枠
+    badge = {"+": "🆕 ", "!": "🔔 "}.get(mark, "")
+    icon = "🛫" if is_dep else "🛬"
+    code = flight_code(flight)
+    name = f"{badge}{icon} {code}"
+    hkg_line = f"HKG {fmt_md(sched_dt)} {sched_txt} HKT"
+    ngo_line = "NGO --/-- --:-- JST" if ngo_dt is None else f"NGO {fmt_md(ngo_dt)} {ngo_dt:%H:%M} JST (推定)"
+    if is_dep:
+        times = [f"`🛫 {hkg_line}`", f"`🛬 {ngo_line}`"]
+    else:
+        times = [f"`🛫 {ngo_line}`", f"`🛬 {hkg_line}`"]
+    value = "\n".join([route_text, *times, status_disp])
+    kind = {"+": "new", "!": "changed"}.get(mark, "")
+    return {"name": name[:256], "value": value[:1024], "inline": False}, sig, kind
+
+
+def flight_key(flight: dict) -> str:
+    nos = "/".join(x.get("no", "") for x in flight.get("flight", []))
+    return f"{flight.get('_type')}_{flight.get('date')}_{nos}"
+
+
+def build_fields(flights: list[dict], today: dt.date, state: dict, new_state: dict) -> tuple[list[dict], int]:
+    fields, changed, cur = [], 0, None
+    for f in flights:
+        d = f.get("date", "")
+        if d != cur:
+            cur = d
+            fields.append({"name": f"━━ {day_label(d, today)} ━━", "value": "\u200b", "inline": False})
+        key = flight_key(f)
+        field, sig, kind = describe(f, today, state.get(key))
+        new_state[key] = sig
+        if kind:
+            changed += 1
+        fields.append(field)
+    return fields, changed
+
+
+def strip_new_badges(fields: list[dict]) -> list[dict]:
+    return [{**f, "name": f["name"].replace("🆕 ", ""), "value": f["value"].replace(" [新規]", "")} for f in fields]
+
+
+def fields_to_text(fields: list[dict]) -> str:
+    if not fields:
+        return "  該当便なし"
+    out = []
+    for f in fields:
+        if f["value"] == "\u200b":
+            out.append(f" {f['name']}")
+        else:
+            out.append(f"  {f['name']}\n" + "\n".join("    " + l for l in f["value"].splitlines()))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- Discord
+def _embeds(title: str, fields: list[dict], color: int) -> list[dict]:
+    if not fields:
+        return [{"title": title, "description": "該当便なし", "color": color}]
+    return [{"title": title if i == 0 else f"{title} (続き)", "color": color, "fields": fields[i:i + 24]}
+            for i in range(0, len(fields), 24)]
+
+
+def post_discord(webhook: str, title: str, period: str, dep_fields: list[dict], arr_fields: list[dict],
+                 n_dep: int, n_arr: int, n_changed: int) -> None:
+    embeds = _embeds(f"出発便  HKG → NGO  ({n_dep} 件)", dep_fields, _color("DISCORD_COLOR_DEP", 0x3B82F6)) + \
+             _embeds(f"到着便  NGO → HKG  ({n_arr} 件)", arr_fields, _color("DISCORD_COLOR_ARR", 0x22C55E))
+    embeds[-1]["footer"] = {"text": f"HKT={香港時間} / JST=日本時間 ・ 推定=標準所要時間からの概算 ・ 🔔=前回から変化 ・ 🆕=新規 ・ 更新 {dt.datetime.now():%m/%d %H:%M} JST"}
+    chg = f"  ・ 変化 {n_changed} 件" if n_changed else ""
+    for i in range(0, len(embeds), 10):
+        payload = {"embeds": embeds[i:i + 10]}
+        if i == 0:
+            payload["content"] = f"**{title}**{chg}\n対象期間: {period}"
+        r = requests.post(webhook, json=payload, timeout=15)
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", "2")))
+            r = requests.post(webhook, json=payload, timeout=15)
+        r.raise_for_status()
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+# ---------------------------------------------------------------- main
+def main() -> int:
+    global FLIGHT_MIN_HKG_NGO, FLIGHT_MIN_NGO_HKG
+    load_dotenv(BASE_DIR / ".env")
+    FLIGHT_MIN_HKG_NGO = int(os.environ.get("FLIGHT_MINUTES_HKG_NGO", FLIGHT_MIN_HKG_NGO))
+    FLIGHT_MIN_NGO_HKG = int(os.environ.get("FLIGHT_MINUTES_NGO_HKG", FLIGHT_MIN_NGO_HKG))
+
+    p = argparse.ArgumentParser(description="HKG カーゴ便から名古屋発着便を Discord へ通知")
+    p.add_argument("--date", help="起点日 YYYY-MM-DD（既定: 今日）")
+    p.add_argument("--days", type=int, default=3, help="取得する日数（既定 3）")
+    p.add_argument("--dry-run", action="store_true", help="Discord へ送信せず表示のみ")
+    p.add_argument("--only-new", action="store_true", help="前回通知から変化が無ければ送らない")
+    p.add_argument("--notify-empty", action="store_true", help="該当便 0 件でも通知する")
+    p.add_argument("--webhook", help="Discord Webhook URL（環境変数より優先）")
+    p.add_argument("--reset-state", action="store_true", help="前回状態を無視する（全件を新規扱い）")
+    a = p.parse_args()
+
+    today = dt.date.fromisoformat(a.date) if a.date else dt.date.today()
+    dates = [(today + dt.timedelta(days=i)).isoformat() for i in range(max(1, a.days))]
 
     session = requests.Session()
     session.headers.update(HEADERS)
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_dep = ex.submit(fetch_all, session, "dep", dates)
+        f_arr = ex.submit(fetch_all, session, "arr", dates)
+        dep, arr = f_dep.result(), f_arr.result()
+    print(f"取得 {time.perf_counter() - t0:.1f}s")
 
-    print("\n【出発便】 HKG → NGO")
-    dep_flights = fetch_all(session, "dep")
+    state = {} if a.reset_state else load_state()
+    new_state: dict = {}
+    dep_fields, c1 = build_fields(dep, today, state, new_state)
+    arr_fields, c2 = build_fields(arr, today, state, new_state)
+    n_changed = c1 + c2 if state else 0  # 初回（状態ファイル無し）は変化件数を数えない
+    if not state:
+        dep_fields, arr_fields = strip_new_badges(dep_fields), strip_new_badges(arr_fields)
 
-    print("\n【到着便】 NGO → HKG")
-    arr_flights = fetch_all(session, "arr")
+    period = f"{day_label(dates[0], today)} 〜 {day_label(dates[-1], today)}"
+    title = f"HKG ⇄ NGO カーゴ便  |  出発 {len(dep)} 件 / 到着 {len(arr)} 件"
+    print(title, f"(変化 {n_changed} 件)" if n_changed else "")
+    print(f"対象期間: {period}")
+    print("[出発便 HKG → NGO]"); print(fields_to_text(dep_fields))
+    print("[到着便 NGO → HKG]"); print(fields_to_text(arr_fields))
 
-    print_section(dep_flights, "出発便 (HKG → NGO)")
-    print_section(arr_flights, "到着便 (NGO → HKG)")
+    if a.dry_run:
+        return 0
+    if not (dep or arr) and not a.notify_empty:
+        print("通知対象なしのため送信スキップ（--notify-empty で送信可）")
+        return 0
+    if a.only_new and state and n_changed == 0:
+        print("前回通知から変化なしのためスキップ")
+        return 0
 
-    notify_discord(dep_flights, arr_flights)
+    webhook = a.webhook or os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook:
+        print("[ERROR] DISCORD_WEBHOOK_URL が未設定です（.env か環境変数で指定）", file=sys.stderr)
+        return 3
+    try:
+        post_discord(webhook, title, period, dep_fields, arr_fields, len(dep), len(arr), n_changed)
+        print("Discord へ送信しました")
+    except Exception as e:  # noqa: BLE001
+        print(f"[ERROR] Discord 送信失敗: {e}", file=sys.stderr)
+        return 4
+    # 送信できたときだけ状態を更新（古い日付は捨てる）
+    keep = {k: v for k, v in new_state.items()}
+    STATE_FILE.write_text(json.dumps(keep, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
