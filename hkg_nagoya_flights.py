@@ -202,6 +202,58 @@ def fmt_md(d) -> str:
     return f"{d:%m/%d}({WEEKDAY_JA[d.weekday()]})"
 
 
+def _mins_diff(a: str, b: str):
+    """'04:37' - '04:35' → +2（日またぎは ±12h 以内で補正）"""
+    try:
+        ha, ma = map(int, a[:5].split(":")); hb, mb = map(int, b[:5].split(":"))
+    except ValueError:
+        return None
+    d = (ha * 60 + ma) - (hb * 60 + mb)
+    if d > 720:
+        d -= 1440
+    elif d < -720:
+        d += 1440
+    return d
+
+
+def pretty_status(status: str, sched_txt: str, is_dep: bool, prev_status, prev_sched, kind: str) -> str:
+    """内部状態（'定刻' / '出発済 04:37' / '変更 05:20' / '遅延' / '欠航' / その他）→ 見やすい 1 行
+    例: ✅ 出発済み 04:37（予定 04:35、+2分） / 🟡 時刻変更 → 05:20（予定 04:35、+45分） / 🟢 定刻どおり
+    """
+    s = status.strip()
+    tag = "出発" if is_dep else "到着"
+
+    def delta(t: str) -> str:
+        d = _mins_diff(t, sched_txt)
+        if d is None:
+            return ""
+        return "、定刻" if d == 0 else f"、{d:+d}分"
+
+    if s == "定刻":
+        line = "🟢 定刻どおり"
+    elif s.startswith(("出発済", "到着済")):
+        actual = s.split(" ", 1)[1] if " " in s else ""
+        line = f"✅ {tag}済み {actual}（予定 {sched_txt}{delta(actual)}）" if actual else f"✅ {tag}済み"
+    elif s.startswith("変更"):
+        new = s.split(" ", 1)[1] if " " in s else ""
+        line = f"🟡 時刻変更 → {new}（予定 {sched_txt}{delta(new)}）" if new else "🟡 時刻変更"
+    elif s == "遅延":
+        line = "🟠 遅延"
+    elif s == "欠航":
+        line = "🔴 欠航"
+    else:
+        line = f"🔵 {s}"
+
+    if kind == "new":
+        line += "\n🆕 新しく追加された便"
+    elif kind == "changed":
+        if prev_sched and prev_sched != sched_txt:
+            line += f"\n🔔 前回: 予定 {prev_sched}・{prev_status or '?'}"
+        else:
+            line += f"\n🔔 前回: {prev_status or '?'}"
+    return line
+
+
 def ngo_time_suffix(txt: str) -> str:
     """'05:40*+1' → ' (翌日・推定)'"""
     parts = []
@@ -244,23 +296,18 @@ def describe(flight: dict, today: dt.date, prev: dict | None) -> tuple[dict, dic
 
     sig = {"sched": sched_txt, "status": status}
     mark = " "
+    kind = ""
     if prev is None:
-        mark = "+"
-        status_disp = status + " [新規]"
+        mark, kind = "+", "new"
     elif prev.get("status") != status or prev.get("sched") != sched_txt:
-        mark = "!"
-        old = prev.get("status", "?")
-        if prev.get("sched") != sched_txt:
-            old = f"{prev.get('sched')} {old}"
-        status_disp = f"{status} ←{old}"
-    else:
-        status_disp = status
+        mark, kind = "!", "changed"
+    status_disp = pretty_status(status, sched_txt, is_dep, (prev or {}).get("status"), (prev or {}).get("sched"), kind)
 
     # 1 便 = 埋め込みフィールド 1 枠
     badge = {"+": "🆕 ", "!": "🔔 "}.get(mark, "")
     icon = "🛫" if is_dep else "🛬"
     code = flight_code(flight)
-    name = f"{badge}{icon} {code}"
+    name = f"{badge}{icon} {code} ｜ {day_label(date_str, today)}"
     hkg_line = f"HKG {fmt_md(sched_dt)} {sched_txt} HKT"
     ngo_line = "NGO --/-- --:-- JST" if ngo_dt is None else f"NGO {fmt_md(ngo_dt)} {ngo_dt:%H:%M} JST (推定)"
     if is_dep:
@@ -278,12 +325,8 @@ def flight_key(flight: dict) -> str:
 
 
 def build_fields(flights: list[dict], today: dt.date, state: dict, new_state: dict) -> tuple[list[dict], int]:
-    fields, changed, cur = [], 0, None
+    fields, changed = [], 0
     for f in flights:
-        d = f.get("date", "")
-        if d != cur:
-            cur = d
-            fields.append({"name": f"━━ {day_label(d, today)} ━━", "value": "\u200b", "inline": False})
         key = flight_key(f)
         field, sig, kind = describe(f, today, state.get(key))
         new_state[key] = sig
@@ -294,7 +337,7 @@ def build_fields(flights: list[dict], today: dt.date, state: dict, new_state: di
 
 
 def strip_new_badges(fields: list[dict]) -> list[dict]:
-    return [{**f, "name": f["name"].replace("🆕 ", ""), "value": f["value"].replace(" [新規]", "")} for f in fields]
+    return [{**f, "name": f["name"].replace("🆕 ", ""), "value": f["value"].replace("\n🆕 新しく追加された便", "")} for f in fields]
 
 
 def fields_to_text(fields: list[dict]) -> str:
@@ -321,7 +364,7 @@ def post_discord(webhook: str, title: str, period: str, dep_fields: list[dict], 
                  n_dep: int, n_arr: int, n_changed: int) -> None:
     embeds = _embeds(f"出発便  HKG → NGO  ({n_dep} 件)", dep_fields, _color("DISCORD_COLOR_DEP", 0x3B82F6)) + \
              _embeds(f"到着便  NGO → HKG  ({n_arr} 件)", arr_fields, _color("DISCORD_COLOR_ARR", 0x22C55E))
-    embeds[-1]["footer"] = {"text": f"HKT={香港時間} / JST=日本時間 ・ 推定=標準所要時間からの概算 ・ 🔔=前回から変化 ・ 🆕=新規 ・ 更新 {dt.datetime.now():%m/%d %H:%M} JST"}
+    embeds[-1]["footer"] = {"text": f"HKT=香港時間 / JST=日本時間 ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {dt.datetime.now():%m/%d %H:%M} JST"}
     chg = f"  ・ 変化 {n_changed} 件" if n_changed else ""
     for i in range(0, len(embeds), 10):
         payload = {"embeds": embeds[i:i + 10]}
