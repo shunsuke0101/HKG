@@ -5,12 +5,14 @@
 # @brief          香港国際空港(HKG) カーゴ便 名古屋(NGO)関連便 Discord 通知スクリプト
 # @author         Kidera Shunsuke
 # @date           2026/11/08
-# $Version:       1.00
-# $Revision:      2026/11/08
+# $Version:       1.01
+# $Revision:      2026/11/11
 # @note           hongkongairport.com の flightinfo-rest API から出発・到着便を取得し NGO 便を通知
 # @attention      プロジェクトのコーディングフォーマット・コメントフォーマット遵守
 # @par            History
 #                 v1.00 (2026/11/08) - 新規作成
+#                 v1.01 (2026/11/11) - Discord 通知フォーマットを Changi 通知に完全準拠
+#                                      （便間の空行・フッター文言・日付またぎの変更時刻表記）
 # Copyright (c) 2026. All Rights reserved.
 #
 # -----------------------------------------------------------------------------------#
@@ -20,7 +22,7 @@
 モジュール概要：香港国際空港(HKG) カーゴ便 名古屋(NGO)関連便 Discord 通知スクリプト
 ========================================================================================
 香港国際空港（HKG）カーゴフライト（出発・到着）の Nagoya (NGO) 便を抽出して Discord に通知します。
-表示は Changi / 仁川 の通知と共通の表形式です。
+表示は Changi / 仁川 の通知と共通のフォーマット（1 便 = 埋め込みフィールド 1 枠）です。
 
 使い方:
     python hkg_nagoya_flights.py              # 3 日分を取得して Discord へ通知
@@ -85,6 +87,7 @@ WEEKDAY_JA = "月火水木金土日"                      # 曜日表記（weekd
 FLIGHT_MIN_HKG_NGO = 220                          # HKG→NGO 所要時間（分）
 FLIGHT_MIN_NGO_HKG = 250                          # NGO→HKG 所要時間（分）
 TZ_DIFF_MIN = 60                                  # 香港時間 → 日本時間 の時差（分）
+JST = dt.timezone(dt.timedelta(hours=9), "JST")   # 日本時間（フッターの更新時刻用。tzdata 不要の固定オフセット）
 
 
 
@@ -441,6 +444,7 @@ def parse_status(flight: dict, sched_dt: dt.datetime | None) -> tuple[str, dt.da
     - 例: 'Dep 04:37' → ('出発済 04:37', 04:37, False)
           'Est at 05:20' → ('変更 05:20', 05:20, False)
     - 日付をまたぐ実績（例: 23:50 予定 → 00:10 実績）は翌日扱い
+    - 変更後の時刻が予定と別日になる場合は '変更 00:10 (11/09)' のように日付を添える
     ----------------------------------------------------------------------
     Args:
         - flight -> dict --- 便情報
@@ -452,6 +456,7 @@ def parse_status(flight: dict, sched_dt: dt.datetime | None) -> tuple[str, dt.da
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.00 (2026/11/08) - 新規作成
+        - revision       v1.01 (2026/11/11) - 変更後時刻が別日の場合に日付を添える（Changi 通知に準拠）
     ----------------------------------------------------------------------
     """
     is_dep = flight.get("_type") == "dep"
@@ -469,7 +474,10 @@ def parse_status(flight: dict, sched_dt: dt.datetime | None) -> tuple[str, dt.da
         return (f"{tag} {t:%H:%M}" if t else tag), t, False
     if s.startswith("est"):
         if t and sched_dt and t != sched_dt:
-            return f"変更 {t:%H:%M}", t, False
+            txt = f"変更 {t:%H:%M}"
+            if t.date() != sched_dt.date():
+                txt += f" ({t:%m/%d})"
+            return txt, t, False
         return "定刻", None, False
     if "delay" in s:
         return "遅延", t, False
@@ -830,6 +838,7 @@ def build_fields(flights: list[dict], today: dt.date, state: dict, new_state: di
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.00 (2026/11/08) - 新規作成
+        - revision       v1.01 (2026/11/11) - 便と便の間に 1 行空ける（Changi 通知に準拠）
     ----------------------------------------------------------------------
     """
     fields, changed = [], 0
@@ -840,6 +849,9 @@ def build_fields(flights: list[dict], today: dt.date, state: dict, new_state: di
         if kind:
             changed += 1
         fields.append(field)
+    # 便と便の間に 1 行空ける（最後の便には付けない）
+    for fld in fields[:-1]:
+        fld["value"] += "\n\u200b"
     return fields, changed
 
 
@@ -893,17 +905,12 @@ def fields_to_text(fields: list[dict]) -> str:
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.00 (2026/11/08) - 新規作成
+        - revision       v1.01 (2026/11/11) - 便間の空行（ゼロ幅スペース）を除いて表示
     ----------------------------------------------------------------------
     """
     if not fields:
         return "  該当便なし"
-    out = []
-    for f in fields:
-        if f["value"] == "​":
-            out.append(f" {f['name']}")
-        else:
-            out.append(f"  {f['name']}\n" + "\n".join("    " + l for l in f["value"].splitlines()))
-    return "\n".join(out)
+    return "\n".join(f"  {f['name']}\n" + "\n".join("    " + l for l in f["value"].replace("\u200b", "").splitlines()) for f in fields)
 
 
 # @function name:   fields_to_text
@@ -978,11 +985,12 @@ def post_discord(webhook: str, title: str, period: str, dep_fields: list[dict], 
     Notes:
         - author         Kidera-Shunsuke
         - revision       v1.00 (2026/11/08) - 新規作成
+        - revision       v1.01 (2026/11/11) - フッター文言を Changi 通知に準拠
     ----------------------------------------------------------------------
     """
     embeds = _embeds(f"出発便  HKG → NGO  ({n_dep} 件)", dep_fields, _color("DISCORD_COLOR_DEP", 0x3B82F6)) + \
              _embeds(f"到着便  NGO → HKG  ({n_arr} 件)", arr_fields, _color("DISCORD_COLOR_ARR", 0x22C55E))
-    embeds[-1]["footer"] = {"text": f"HKT=香港時間 / JST=日本時間 ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {dt.datetime.now():%m/%d %H:%M} JST"}
+    embeds[-1]["footer"] = {"text": f"HKT=香港時間 / JST=日本時間 ・ 日付は各空港の現地日付 ・ 推定=標準所要時間からの概算 ・ 🔔=前回通知から変化 ・ 更新 {dt.datetime.now(JST):%m/%d %H:%M} JST"}
     chg = f"  ・ 変化 {n_changed} 件" if n_changed else ""
     for i in range(0, len(embeds), 10):  # 10 embeds/message 上限
         payload = {"embeds": embeds[i:i + 10]}
@@ -1108,8 +1116,10 @@ def main() -> int:
     title = f"HKG ⇄ NGO カーゴ便  |  出発 {len(dep)} 件 / 到着 {len(arr)} 件"
     print(title, f"(変化 {n_changed} 件)" if n_changed else "")
     print(f"対象期間: {period}")
-    print("[出発便 HKG → NGO]"); print(fields_to_text(dep_fields))
-    print("[到着便 NGO → HKG]"); print(fields_to_text(arr_fields))
+    print("[出発便  HKG → NGO]")
+    print(fields_to_text(dep_fields))
+    print("[到着便  NGO → HKG]")
+    print(fields_to_text(arr_fields))
 
     # 送信スキップ判定
     if a.dry_run:
